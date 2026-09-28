@@ -98,6 +98,7 @@ async function uploadMediaBase64({
   altText?: string;
   caption?: string;
 }) {
+  if (!/^image\//.test(mimeType)) throw new Error("mime_type must start with image/");
   const normalizedBase64 = base64Data.replace(/^data:[^;]+;base64,/, "");
   const bytes = Buffer.from(normalizedBase64, "base64");
   if (!bytes.length) throw new Error("Image data is empty or invalid base64.");
@@ -478,7 +479,7 @@ const handler = createMcpHandler((server) => {
         "Upload an image to the HAPLAST WordPress Media Library from base64 data and optionally set title, ALT text, and caption. Returns the WordPress media ID for use as featured_media.",
       inputSchema: z.object({
         filename: z.string().min(1),
-        mime_type: z.string().regex(/^image\//),
+        mime_type: z.string().min(1),
         base64_data: z.string().min(16),
         title: z.string().optional(),
         alt_text: z.string().optional(),
@@ -527,7 +528,7 @@ const handler = createMcpHandler((server) => {
       inputSchema: z.object({
         post_id: z.number().int().positive(),
         filename: z.string().min(1),
-        mime_type: z.string().regex(/^image\//),
+        mime_type: z.string().min(1),
         base64_data: z.string().min(16),
         title: z.string().optional(),
         alt_text: z.string().optional(),
