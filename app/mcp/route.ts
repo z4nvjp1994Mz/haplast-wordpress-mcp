@@ -54,6 +54,76 @@ async function rankMathFetch(path: string, init: RequestInit = {}) {
   return apiFetch(`/rankmath/v1${path}`, init);
 }
 
+function cleanMedia(media: any) {
+  return {
+    id: media.id,
+    date: media.date,
+    slug: media.slug,
+    status: media.status,
+    link: media.link,
+    source_url: media.source_url,
+    mime_type: media.mime_type,
+    media_type: media.media_type,
+    alt_text: media.alt_text || "",
+    title: media.title?.rendered || "",
+    caption: media.caption?.rendered || "",
+  };
+}
+
+function safeMediaFilename(filename: string) {
+  const cleaned = filename
+    .replace(/[\r\n"]/g, "")
+    .replace(/[^A-Za-z0-9._-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+  if (!cleaned) throw new Error("Invalid media filename.");
+  return cleaned;
+}
+
+async function uploadMediaBase64({
+  filename,
+  mimeType,
+  base64Data,
+  title,
+  altText,
+  caption,
+}: {
+  filename: string;
+  mimeType: string;
+  base64Data: string;
+  title?: string;
+  altText?: string;
+  caption?: string;
+}) {
+  const normalizedBase64 = base64Data.replace(/^data:[^;]+;base64,/, "");
+  const bytes = Buffer.from(normalizedBase64, "base64");
+  if (!bytes.length) throw new Error("Image data is empty or invalid base64.");
+
+  const safeFilename = safeMediaFilename(filename);
+  const headers = new Headers();
+  headers.set("Content-Type", mimeType);
+  headers.set("Content-Disposition", `attachment; filename="${safeFilename}"`);
+
+  const { data: created } = await wpFetch("/media", {
+    method: "POST",
+    headers,
+    body: bytes,
+  });
+
+  const metadata: Record<string, unknown> = {};
+  if (title !== undefined) metadata.title = title;
+  if (altText !== undefined) metadata.alt_text = altText;
+  if (caption !== undefined) metadata.caption = caption;
+
+  if (Object.keys(metadata).length === 0) return created;
+
+  const { data: updated } = await wpFetch(`/media/${created.id}`, {
+    method: "POST",
+    body: JSON.stringify(metadata),
+  });
+  return updated;
+}
+
 function cleanPost(post: any) {
   return {
     id: post.id,
@@ -192,9 +262,10 @@ const handler = createMcpHandler((server) => {
         slug: z.string().optional(),
         categories: z.array(z.number().int().positive()).optional(),
         tags: z.array(z.number().int().positive()).optional(),
+        featured_media: z.number().int().nonnegative().optional(),
       }),
     },
-    async ({ title, content, excerpt, slug, categories, tags }) => {
+    async ({ title, content, excerpt, slug, categories, tags, featured_media }) => {
       const payload: Record<string, unknown> = {
         title,
         content,
@@ -204,6 +275,7 @@ const handler = createMcpHandler((server) => {
       if (slug) payload.slug = slug;
       if (categories) payload.categories = categories;
       if (tags) payload.tags = tags;
+      if (featured_media !== undefined) payload.featured_media = featured_media;
 
       const { data } = await wpFetch("/posts", {
         method: "POST",
@@ -227,6 +299,7 @@ const handler = createMcpHandler((server) => {
         slug: z.string().optional(),
         categories: z.array(z.number().int().positive()).optional(),
         tags: z.array(z.number().int().positive()).optional(),
+        featured_media: z.number().int().nonnegative().optional(),
       }),
     },
     async ({ id, ...changes }) => {
@@ -331,6 +404,7 @@ const handler = createMcpHandler((server) => {
         slug: z.string().optional(),
         categories: z.array(z.number().int().positive()).optional(),
         tags: z.array(z.number().int().positive()).optional(),
+        featured_media: z.number().int().nonnegative().optional(),
         seo_title: z.string().optional(),
         meta_description: z.string().optional(),
         focus_keyword: z.string().optional(),
@@ -344,6 +418,7 @@ const handler = createMcpHandler((server) => {
       slug,
       categories,
       tags,
+      featured_media,
       seo_title,
       meta_description,
       focus_keyword,
@@ -358,6 +433,7 @@ const handler = createMcpHandler((server) => {
       if (slug) payload.slug = slug;
       if (categories) payload.categories = categories;
       if (tags) payload.tags = tags;
+      if (featured_media !== undefined) payload.featured_media = featured_media;
 
       const { data: post } = await wpFetch("/posts", {
         method: "POST",
@@ -387,6 +463,100 @@ const handler = createMcpHandler((server) => {
         post: cleanPost(post),
         rank_math_meta: meta,
         rank_math_response: rankMathResponse,
+      });
+    },
+  );
+
+  server.registerTool(
+    "upload_media_base64",
+    {
+      title: "Upload HAPLAST media",
+      description:
+        "Upload an image to the HAPLAST WordPress Media Library from base64 data and optionally set title, ALT text, and caption. Returns the WordPress media ID for use as featured_media.",
+      inputSchema: z.object({
+        filename: z.string().min(1),
+        mime_type: z.string().regex(/^image\//),
+        base64_data: z.string().min(16),
+        title: z.string().optional(),
+        alt_text: z.string().optional(),
+        caption: z.string().optional(),
+      }),
+    },
+    async ({ filename, mime_type, base64_data, title, alt_text, caption }) => {
+      const media = await uploadMediaBase64({
+        filename,
+        mimeType: mime_type,
+        base64Data: base64_data,
+        title,
+        altText: alt_text,
+        caption,
+      });
+      return toolResult(cleanMedia(media));
+    },
+  );
+
+  server.registerTool(
+    "set_featured_image",
+    {
+      title: "Set HAPLAST featured image",
+      description:
+        "Set an existing WordPress Media Library item as the Featured Image of a HAPLAST post and verify the saved featured_media value.",
+      inputSchema: z.object({
+        post_id: z.number().int().positive(),
+        media_id: z.number().int().positive(),
+      }),
+    },
+    async ({ post_id, media_id }) => {
+      const { data } = await wpFetch(`/posts/${post_id}`, {
+        method: "POST",
+        body: JSON.stringify({ featured_media: media_id }),
+      });
+      return toolResult(cleanPost(data));
+    },
+  );
+
+  server.registerTool(
+    "upload_and_set_featured_image",
+    {
+      title: "Upload and set HAPLAST featured image",
+      description:
+        "Upload an image to the HAPLAST WordPress Media Library, save SEO-friendly media metadata, assign it as the post Featured Image, and return both media and verified post data.",
+      inputSchema: z.object({
+        post_id: z.number().int().positive(),
+        filename: z.string().min(1),
+        mime_type: z.string().regex(/^image\//),
+        base64_data: z.string().min(16),
+        title: z.string().optional(),
+        alt_text: z.string().optional(),
+        caption: z.string().optional(),
+      }),
+    },
+    async ({
+      post_id,
+      filename,
+      mime_type,
+      base64_data,
+      title,
+      alt_text,
+      caption,
+    }) => {
+      const media = await uploadMediaBase64({
+        filename,
+        mimeType: mime_type,
+        base64Data: base64_data,
+        title,
+        altText: alt_text,
+        caption,
+      });
+
+      const { data: post } = await wpFetch(`/posts/${post_id}`, {
+        method: "POST",
+        body: JSON.stringify({ featured_media: media.id }),
+      });
+
+      return toolResult({
+        media: cleanMedia(media),
+        post: cleanPost(post),
       });
     },
   );
