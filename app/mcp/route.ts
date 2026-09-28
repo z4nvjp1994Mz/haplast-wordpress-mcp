@@ -17,9 +17,9 @@ function authHeader() {
   return `Basic ${token}`;
 }
 
-async function wpFetch(path: string, init: RequestInit = {}) {
+async function apiFetch(apiPath: string, init: RequestInit = {}) {
   ensureConfig();
-  const url = `${WP_URL}/wp-json/wp/v2${path}`;
+  const url = `${WP_URL}/wp-json${apiPath}`;
   const headers = new Headers(init.headers);
   headers.set("Authorization", authHeader());
   headers.set("Accept", "application/json");
@@ -44,6 +44,14 @@ async function wpFetch(path: string, init: RequestInit = {}) {
   }
 
   return { data, headers: res.headers };
+}
+
+async function wpFetch(path: string, init: RequestInit = {}) {
+  return apiFetch(`/wp/v2${path}`, init);
+}
+
+async function rankMathFetch(path: string, init: RequestInit = {}) {
+  return apiFetch(`/rankmath/v1${path}`, init);
 }
 
 function cleanPost(post: any) {
@@ -233,6 +241,153 @@ const handler = createMcpHandler((server) => {
         body: JSON.stringify(payload),
       });
       return toolResult(cleanPost(data));
+    },
+  );
+
+  server.registerTool(
+    "update_rank_math_seo",
+    {
+      title: "Update Rank Math SEO metadata",
+      description:
+        "Update Rank Math SEO fields for an existing WordPress post, including SEO title, meta description, focus keyword, canonical URL, and social metadata. Use after drafting or editing content.",
+      inputSchema: z.object({
+        id: z.number().int().positive(),
+        seo_title: z.string().optional(),
+        meta_description: z.string().optional(),
+        focus_keyword: z.string().optional(),
+        canonical_url: z.string().url().optional(),
+        facebook_title: z.string().optional(),
+        facebook_description: z.string().optional(),
+        robots: z.array(z.string()).optional(),
+      }),
+    },
+    async ({
+      id,
+      seo_title,
+      meta_description,
+      focus_keyword,
+      canonical_url,
+      facebook_title,
+      facebook_description,
+      robots,
+    }) => {
+      const meta: Record<string, unknown> = {};
+      if (seo_title !== undefined) meta.rank_math_title = seo_title;
+      if (meta_description !== undefined) meta.rank_math_description = meta_description;
+      if (focus_keyword !== undefined) meta.rank_math_focus_keyword = focus_keyword;
+      if (canonical_url !== undefined) meta.rank_math_canonical_url = canonical_url;
+      if (facebook_title !== undefined) meta.rank_math_facebook_title = facebook_title;
+      if (facebook_description !== undefined) meta.rank_math_facebook_description = facebook_description;
+      if (robots !== undefined) meta.rank_math_robots = robots;
+
+      if (Object.keys(meta).length === 0) {
+        throw new Error("No Rank Math SEO fields supplied.");
+      }
+
+      const { data } = await rankMathFetch("/updateMeta", {
+        method: "POST",
+        body: JSON.stringify({
+          objectID: id,
+          objectType: "post",
+          meta,
+        }),
+      });
+
+      return toolResult({
+        post_id: id,
+        updated_meta: meta,
+        rank_math_response: data,
+      });
+    },
+  );
+
+  server.registerTool(
+    "get_rank_math_head",
+    {
+      title: "Read Rank Math rendered SEO head",
+      description:
+        "Read Rank Math's rendered SEO head for a public URL when Rank Math Headless CMS support is enabled. Useful for verifying title, description, canonical and social tags after publishing.",
+      inputSchema: z.object({
+        url: z.string().url(),
+      }),
+    },
+    async ({ url }) => {
+      const qs = new URLSearchParams({ url });
+      const { data } = await rankMathFetch(`/getHead?${qs.toString()}`);
+      return toolResult(data);
+    },
+  );
+
+  server.registerTool(
+    "create_seo_draft",
+    {
+      title: "Create HAPLAST SEO draft",
+      description:
+        "Create a WordPress draft and immediately save Rank Math SEO metadata. The post remains a draft and is never published by this tool.",
+      inputSchema: z.object({
+        title: z.string().min(1),
+        content: z.string().min(1),
+        excerpt: z.string().optional(),
+        slug: z.string().optional(),
+        categories: z.array(z.number().int().positive()).optional(),
+        tags: z.array(z.number().int().positive()).optional(),
+        seo_title: z.string().optional(),
+        meta_description: z.string().optional(),
+        focus_keyword: z.string().optional(),
+        canonical_url: z.string().url().optional(),
+      }),
+    },
+    async ({
+      title,
+      content,
+      excerpt,
+      slug,
+      categories,
+      tags,
+      seo_title,
+      meta_description,
+      focus_keyword,
+      canonical_url,
+    }) => {
+      const payload: Record<string, unknown> = {
+        title,
+        content,
+        status: "draft",
+      };
+      if (excerpt !== undefined) payload.excerpt = excerpt;
+      if (slug) payload.slug = slug;
+      if (categories) payload.categories = categories;
+      if (tags) payload.tags = tags;
+
+      const { data: post } = await wpFetch("/posts", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+
+      const meta: Record<string, unknown> = {};
+      if (seo_title !== undefined) meta.rank_math_title = seo_title;
+      if (meta_description !== undefined) meta.rank_math_description = meta_description;
+      if (focus_keyword !== undefined) meta.rank_math_focus_keyword = focus_keyword;
+      if (canonical_url !== undefined) meta.rank_math_canonical_url = canonical_url;
+
+      let rankMathResponse: unknown = null;
+      if (Object.keys(meta).length > 0) {
+        const { data } = await rankMathFetch("/updateMeta", {
+          method: "POST",
+          body: JSON.stringify({
+            objectID: post.id,
+            objectType: "post",
+            meta,
+          }),
+        });
+        rankMathResponse = data;
+      }
+
+      return toolResult({
+        post: cleanPost(post),
+        rank_math_meta: meta,
+        rank_math_response: rankMathResponse,
+      });
     },
   );
 
