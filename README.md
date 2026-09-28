@@ -12,6 +12,9 @@ Remote MCP server for `haplastgroup.com`.
 - Update posts
 - Publish a post when explicitly requested
 - Schedule a post
+- Upload images to the WordPress Media Library
+- Set or replace a post Featured Image
+- Upload an image and assign it as Featured Image in one workflow
 
 ## Required Vercel environment variables
 
