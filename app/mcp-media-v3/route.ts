@@ -291,6 +291,13 @@ function toolResult(value: unknown) {
   };
 }
 
+const openAIFileSchema = z.object({
+  download_url: z.string().url(),
+  file_id: z.string().min(1),
+  mime_type: z.string().optional(),
+  file_name: z.string().optional(),
+});
+
 const handler = createMcpHandler((server) => {
   server.registerTool(
     "get_latest_posts",
@@ -606,6 +613,107 @@ const handler = createMcpHandler((server) => {
   );
 
   server.registerTool(
+    "upload_media_from_file",
+    {
+      title: "Upload HAPLAST media from ChatGPT file",
+      description:
+        "Upload an image file passed directly by ChatGPT into the HAPLAST WordPress Media Library. This avoids sending large base64 strings through the model context. Use for generated or attached images that ChatGPT can provide as a file parameter.",
+      inputSchema: z.object({
+        file: openAIFileSchema,
+        filename: z.string().min(1).optional(),
+        title: z.string().optional(),
+        alt_text: z.string().optional(),
+        caption: z.string().optional(),
+      }),
+      _meta: {
+        "openai/fileParams": ["file"],
+      },
+    },
+    async ({ file, filename, title, alt_text, caption }) => {
+      const resolvedFilename =
+        filename ||
+        file.file_name ||
+        `haplast-chatgpt-image-${file.file_id}.jpg`;
+
+      if (file.mime_type !== undefined && !file.mime_type.startsWith("image/")) {
+        throw new Error("file.mime_type must start with image/.");
+      }
+
+      const media = await uploadMediaFromUrl({
+        imageUrl: file.download_url,
+        filename: resolvedFilename,
+        mimeType: file.mime_type,
+        title,
+        altText: alt_text,
+        caption,
+      });
+
+      return toolResult({
+        media: cleanMedia(media),
+        input_file: {
+          file_id: file.file_id,
+          file_name: file.file_name || "",
+          mime_type: file.mime_type || "",
+        },
+      });
+    },
+  );
+
+  server.registerTool(
+    "upload_file_and_set_featured_image",
+    {
+      title: "Upload ChatGPT file and set HAPLAST featured image",
+      description:
+        "Upload an image file passed directly by ChatGPT to the WordPress Media Library, assign it as the Featured Image for an existing HAPLAST post, and return verified post data. This avoids large base64 handoff.",
+      inputSchema: z.object({
+        post_id: z.number().int().positive(),
+        file: openAIFileSchema,
+        filename: z.string().min(1).optional(),
+        title: z.string().optional(),
+        alt_text: z.string().optional(),
+        caption: z.string().optional(),
+      }),
+      _meta: {
+        "openai/fileParams": ["file"],
+      },
+    },
+    async ({ post_id, file, filename, title, alt_text, caption }) => {
+      const resolvedFilename =
+        filename ||
+        file.file_name ||
+        `haplast-chatgpt-featured-${file.file_id}.jpg`;
+
+      if (file.mime_type !== undefined && !file.mime_type.startsWith("image/")) {
+        throw new Error("file.mime_type must start with image/.");
+      }
+
+      const media = await uploadMediaFromUrl({
+        imageUrl: file.download_url,
+        filename: resolvedFilename,
+        mimeType: file.mime_type,
+        title,
+        altText: alt_text,
+        caption,
+      });
+
+      const { data: post } = await wpFetch(`/posts/${post_id}`, {
+        method: "POST",
+        body: JSON.stringify({ featured_media: media.id }),
+      });
+
+      return toolResult({
+        media: cleanMedia(media),
+        post: cleanPost(post),
+        input_file: {
+          file_id: file.file_id,
+          file_name: file.file_name || "",
+          mime_type: file.mime_type || "",
+        },
+      });
+    },
+  );
+
+  server.registerTool(
     "upload_media_base64",
     {
       title: "Upload HAPLAST media",
@@ -898,7 +1006,7 @@ const handler = createMcpHandler((server) => {
     },
   );
 }, {
-  serverInfo: { name: "haplast-wordpress-media-v3", version: "0.4.0" },
+  serverInfo: { name: "haplast-wordpress-media-v3", version: "0.5.0" },
   verboseLogs: true,
 });
 
