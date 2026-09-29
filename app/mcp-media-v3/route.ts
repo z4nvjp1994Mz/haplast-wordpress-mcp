@@ -7,6 +7,7 @@ import { z } from "zod";
 const WP_URL = (process.env.WORDPRESS_URL || "").replace(/\/$/, "");
 const WP_USER = process.env.WORDPRESS_USERNAME || "";
 const WP_APP_PASSWORD = process.env.WORDPRESS_APP_PASSWORD || "";
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 
 function ensureConfig() {
   if (!WP_URL) throw new Error("Missing WORDPRESS_URL");
@@ -197,6 +198,68 @@ async function uploadMediaFromUrl({
     altText,
     caption,
   });
+}
+
+function ensureOpenAIConfig() {
+  if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
+}
+
+async function generateImageBase64({
+  prompt,
+  size,
+  quality,
+}: {
+  prompt: string;
+  size: "1024x1024" | "1536x1024" | "1024x1536";
+  quality: "low" | "medium" | "high";
+}) {
+  ensureOpenAIConfig();
+
+  const res = await fetch("https://api.openai.com/v1/images/generations", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "gpt-image-2",
+      prompt,
+      n: 1,
+      size,
+      quality,
+      output_format: "jpeg",
+      output_compression: 90,
+    }),
+    cache: "no-store",
+  });
+
+  const text = await res.text();
+  let data: any;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = text;
+  }
+
+  if (!res.ok) {
+    const message =
+      data?.error?.message ||
+      (typeof data === "string" ? data.slice(0, 500) : JSON.stringify(data));
+    throw new Error(`OpenAI Images API ${res.status}: ${message}`);
+  }
+
+  const base64Data = data?.data?.[0]?.b64_json;
+  if (!base64Data || typeof base64Data !== "string") {
+    throw new Error("OpenAI Images API returned no b64_json image data.");
+  }
+
+  return {
+    base64Data,
+    revisedPrompt: data?.data?.[0]?.revised_prompt || "",
+    size: data?.size || size,
+    quality: data?.quality || quality,
+    outputFormat: data?.output_format || "jpeg",
+  };
 }
 
 function cleanPost(post: any) {
@@ -571,6 +634,46 @@ const handler = createMcpHandler((server) => {
   );
 
   server.registerTool(
+    "generate_and_upload_media",
+    {
+      title: "Generate and upload HAPLAST media",
+      description:
+        "Generate one new image with OpenAI GPT Image directly inside this MCP server, receive base64 image data server-side, and upload it immediately to the HAPLAST WordPress Media Library. Use this to avoid cross-tool file, URL, or base64 handoff problems.",
+      inputSchema: z.object({
+        prompt: z.string().min(1).max(32000),
+        filename: z.string().min(1),
+        alt_text: z.string().optional(),
+        title: z.string().optional(),
+        caption: z.string().optional(),
+        size: z.enum(["1024x1024", "1536x1024", "1024x1536"]).default("1536x1024"),
+        quality: z.enum(["low", "medium", "high"]).default("medium"),
+      }),
+    },
+    async ({ prompt, filename, alt_text, title, caption, size, quality }) => {
+      const generated = await generateImageBase64({ prompt, size, quality });
+      const media = await uploadMediaBase64({
+        filename,
+        mimeType: "image/jpeg",
+        base64Data: generated.base64Data,
+        title,
+        altText: alt_text,
+        caption,
+      });
+
+      return toolResult({
+        media: cleanMedia(media),
+        generation: {
+          model: "gpt-image-2",
+          size: generated.size,
+          quality: generated.quality,
+          output_format: generated.outputFormat,
+          revised_prompt: generated.revisedPrompt,
+        },
+      });
+    },
+  );
+
+  server.registerTool(
     "upload_media_from_url",
     {
       title: "Upload HAPLAST media from URL",
@@ -668,6 +771,53 @@ const handler = createMcpHandler((server) => {
   );
 
   server.registerTool(
+    "generate_upload_and_set_featured_image",
+    {
+      title: "Generate, upload and set HAPLAST featured image",
+      description:
+        "Generate one new image with OpenAI GPT Image directly inside this MCP server, upload it to the HAPLAST WordPress Media Library, assign it as the Featured Image for an existing post, and return verified post data.",
+      inputSchema: z.object({
+        post_id: z.number().int().positive(),
+        prompt: z.string().min(1).max(32000),
+        filename: z.string().min(1),
+        alt_text: z.string().optional(),
+        title: z.string().optional(),
+        caption: z.string().optional(),
+        size: z.enum(["1024x1024", "1536x1024", "1024x1536"]).default("1536x1024"),
+        quality: z.enum(["low", "medium", "high"]).default("medium"),
+      }),
+    },
+    async ({ post_id, prompt, filename, alt_text, title, caption, size, quality }) => {
+      const generated = await generateImageBase64({ prompt, size, quality });
+      const media = await uploadMediaBase64({
+        filename,
+        mimeType: "image/jpeg",
+        base64Data: generated.base64Data,
+        title,
+        altText: alt_text,
+        caption,
+      });
+
+      const { data: post } = await wpFetch(`/posts/${post_id}`, {
+        method: "POST",
+        body: JSON.stringify({ featured_media: media.id }),
+      });
+
+      return toolResult({
+        media: cleanMedia(media),
+        post: cleanPost(post),
+        generation: {
+          model: "gpt-image-2",
+          size: generated.size,
+          quality: generated.quality,
+          output_format: generated.outputFormat,
+          revised_prompt: generated.revisedPrompt,
+        },
+      });
+    },
+  );
+
+  server.registerTool(
     "upload_and_set_featured_image_from_url",
     {
       title: "Upload and set HAPLAST featured image from URL",
@@ -748,7 +898,7 @@ const handler = createMcpHandler((server) => {
     },
   );
 }, {
-  serverInfo: { name: "haplast-wordpress-media-v3", version: "0.3.0" },
+  serverInfo: { name: "haplast-wordpress-media-v3", version: "0.4.0" },
   verboseLogs: true,
 });
 
