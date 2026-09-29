@@ -83,25 +83,54 @@ function safeMediaFilename(filename: string) {
   return cleaned;
 }
 
-async function uploadMediaBase64({
+const MAX_REMOTE_IMAGE_BYTES = 15 * 1024 * 1024;
+
+function validateRemoteImageUrl(value: string) {
+  const url = new URL(value);
+  if (url.protocol !== "https:") throw new Error("Remote media URL must use HTTPS.");
+  if (url.username || url.password) throw new Error("Remote media URL must not contain credentials.");
+
+  const host = url.hostname.toLowerCase();
+  const blockedHost =
+    host === "localhost" ||
+    host.endsWith(".localhost") ||
+    host.endsWith(".local") ||
+    host === "0.0.0.0" ||
+    host === "127.0.0.1" ||
+    host === "::1" ||
+    /^10\./.test(host) ||
+    /^192\.168\./.test(host) ||
+    /^169\.254\./.test(host) ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(host);
+
+  if (blockedHost) throw new Error("Remote media URL points to a blocked local/private host.");
+  return url;
+}
+
+function detectImageMimeType(bytes: Buffer) {
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
+  if (bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return "image/png";
+  if (bytes.length >= 12 && bytes.toString("ascii", 0, 4) === "RIFF" && bytes.toString("ascii", 8, 12) === "WEBP") return "image/webp";
+  return "";
+}
+
+async function uploadMediaBytes({
   filename,
   mimeType,
-  base64Data,
+  bytes,
   title,
   altText,
   caption,
 }: {
   filename: string;
   mimeType: string;
-  base64Data: string;
+  bytes: Buffer;
   title?: string;
   altText?: string;
   caption?: string;
 }) {
   if (!/^image\//.test(mimeType)) throw new Error("mime_type must start with image/");
-  const normalizedBase64 = base64Data.replace(/^data:[^;]+;base64,/, "");
-  const bytes = Buffer.from(normalizedBase64, "base64");
-  if (!bytes.length) throw new Error("Image data is empty or invalid base64.");
+  if (!bytes.length) throw new Error("Image data is empty.");
 
   const safeFilename = safeMediaFilename(filename);
   const headers = new Headers();
@@ -126,6 +155,80 @@ async function uploadMediaBase64({
     body: JSON.stringify(metadata),
   });
   return updated;
+}
+
+async function uploadMediaBase64({
+  filename,
+  mimeType,
+  base64Data,
+  title,
+  altText,
+  caption,
+}: {
+  filename: string;
+  mimeType: string;
+  base64Data: string;
+  title?: string;
+  altText?: string;
+  caption?: string;
+}) {
+  const normalizedBase64 = base64Data.replace(/^data:[^;]+;base64,/, "");
+  const bytes = Buffer.from(normalizedBase64, "base64");
+  return uploadMediaBytes({ filename, mimeType, bytes, title, altText, caption });
+}
+
+async function uploadMediaFromUrl({
+  imageUrl,
+  filename,
+  mimeType,
+  title,
+  altText,
+  caption,
+}: {
+  imageUrl: string;
+  filename: string;
+  mimeType?: string;
+  title?: string;
+  altText?: string;
+  caption?: string;
+}) {
+  const requestedUrl = validateRemoteImageUrl(imageUrl);
+  const res = await fetch(requestedUrl, {
+    method: "GET",
+    headers: { Accept: "image/*" },
+    redirect: "follow",
+    cache: "no-store",
+  });
+
+  if (!res.ok) throw new Error(`Remote image download failed with HTTP ${res.status}.`);
+  validateRemoteImageUrl(res.url || requestedUrl.toString());
+
+  const contentLength = Number(res.headers.get("content-length") || "0");
+  if (contentLength > MAX_REMOTE_IMAGE_BYTES) throw new Error("Remote image exceeds the 15 MB size limit.");
+
+  const bytes = Buffer.from(await res.arrayBuffer());
+  if (!bytes.length) throw new Error("Remote image download returned empty data.");
+  if (bytes.length > MAX_REMOTE_IMAGE_BYTES) throw new Error("Remote image exceeds the 15 MB size limit.");
+
+  const responseMimeType = (res.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+  const detectedMimeType = detectImageMimeType(bytes);
+  const resolvedMimeType = mimeType || (responseMimeType.startsWith("image/") ? responseMimeType : detectedMimeType);
+
+  if (!resolvedMimeType || !resolvedMimeType.startsWith("image/")) {
+    throw new Error("Remote URL did not return a supported image.");
+  }
+  if (mimeType && detectedMimeType && mimeType !== detectedMimeType) {
+    throw new Error(`Declared MIME type ${mimeType} does not match detected image type ${detectedMimeType}.`);
+  }
+
+  return uploadMediaBytes({
+    filename,
+    mimeType: resolvedMimeType,
+    bytes,
+    title,
+    altText,
+    caption,
+  });
 }
 
 function cleanPost(post: any) {
@@ -500,6 +603,37 @@ const handler = createMcpHandler((server) => {
   );
 
   server.registerTool(
+    "upload_media_from_url",
+    {
+      title: "Upload HAPLAST media from URL",
+      description:
+        "Download an image from a temporary/public HTTPS URL on the server side, upload it to the HAPLAST WordPress Media Library, and optionally save title, ALT text, and caption.",
+      inputSchema: z.object({
+        image_url: z.string().url(),
+        filename: z.string().min(1),
+        mime_type: z.string().optional(),
+        title: z.string().optional(),
+        alt_text: z.string().optional(),
+        caption: z.string().optional(),
+      }),
+    },
+    async ({ image_url, filename, mime_type, title, alt_text, caption }) => {
+      if (mime_type !== undefined && !mime_type.startsWith("image/")) {
+        throw new Error("mime_type must start with image/.");
+      }
+      const media = await uploadMediaFromUrl({
+        imageUrl: image_url,
+        filename,
+        mimeType: mime_type,
+        title,
+        altText: alt_text,
+        caption,
+      });
+      return toolResult(cleanMedia(media));
+    },
+  );
+
+  server.registerTool(
     "set_featured_image",
     {
       title: "Set HAPLAST featured image",
@@ -562,6 +696,42 @@ const handler = createMcpHandler((server) => {
         media: cleanMedia(media),
         post: cleanPost(post),
       });
+    },
+  );
+
+  server.registerTool(
+    "upload_and_set_featured_image_from_url",
+    {
+      title: "Upload and set HAPLAST featured image from URL",
+      description:
+        "Download an image from a temporary/public HTTPS URL, upload it to the HAPLAST WordPress Media Library, assign it as the post Featured Image, and return both media and verified post data.",
+      inputSchema: z.object({
+        post_id: z.number().int().positive(),
+        image_url: z.string().url(),
+        filename: z.string().min(1),
+        mime_type: z.string().optional(),
+        title: z.string().optional(),
+        alt_text: z.string().optional(),
+        caption: z.string().optional(),
+      }),
+    },
+    async ({ post_id, image_url, filename, mime_type, title, alt_text, caption }) => {
+      if (mime_type !== undefined && !mime_type.startsWith("image/")) {
+        throw new Error("mime_type must start with image/.");
+      }
+      const media = await uploadMediaFromUrl({
+        imageUrl: image_url,
+        filename,
+        mimeType: mime_type,
+        title,
+        altText: alt_text,
+        caption,
+      });
+      const { data: post } = await wpFetch(`/posts/${post_id}`, {
+        method: "POST",
+        body: JSON.stringify({ featured_media: media.id }),
+      });
+      return toolResult({ media: cleanMedia(media), post: cleanPost(post) });
     },
   );
 
